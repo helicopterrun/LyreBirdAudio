@@ -1,10 +1,10 @@
 #!/bin/bash
-# mediamtx-stream-manager.sh - Mono-only: raw L/R + filtered L/R, Opus
-# Version: 1.6.1
+# mediamtx-stream-manager.sh - Mono-only: raw L/R + filtered L/R, libopus
+# Version: 1.7.0
 
 set -euo pipefail
 
-readonly VERSION="1.6.1"
+readonly VERSION="1.7.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -22,9 +22,11 @@ readonly MEDIAMTX_HOST="localhost"
 # ========= Settings =========
 readonly DEFAULT_SAMPLE_RATE="48000"
 readonly DEFAULT_CHANNELS="2"            # capture stereo → split to mono
-readonly DEFAULT_CODEC="opus"
+readonly DEFAULT_CODEC="libopus"         # use libopus (stable), not native 'opus'
 readonly DEFAULT_MONO_BITRATE="64k"
-readonly DEFAULT_FILTERS="highpass=f=800,lowpass=f=10000,aresample=async=1:first_pts=0"
+
+# headroom + filters (soft headroom prevents HPF clipping messages)
+readonly DEFAULT_FILTERS="volume=-3dB,highpass=f=800,lowpass=f=10000,aresample=async=1:first_pts=0"
 
 # ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
@@ -121,11 +123,11 @@ generate_mediamtx_config() {
   cat > "${CONFIG_FILE}" << 'EOF'
 logLevel: info
 api: yes
-apiAddress: :9997
+apiAddress: :9997            # bind all interfaces
 metrics: yes
 metricsAddress: :9998
 rtsp: yes
-rtspAddress: :8554
+rtspAddress: :8554           # bind all interfaces
 rtspTransports: [tcp, udp]
 paths:
   '~^[a-zA-Z0-9_-]+$':
@@ -143,6 +145,9 @@ start_ffmpeg_stream() {
   local log_file="${FFMPEG_PID_DIR}/${stream_name}.log"
   mkdir -p "${FFMPEG_PID_DIR}"
 
+  # Robust filtergraph using pan/asplit (avoids fragile channel_layout assumptions):
+  # - Split input to two copies, pan each to mono L/R
+  # - Split each mono into raw + filtered; apply DEFAULT_FILTERS to the filtered branch
   cat > "$wrapper" << EOF
 #!/bin/bash
 while true; do
@@ -150,18 +155,20 @@ while true; do
     -thread_queue_size 512 \
     -f alsa -ar ${DEFAULT_SAMPLE_RATE} -ac ${DEFAULT_CHANNELS} -i plughw:${card_num},0 \
     -filter_complex "\
-[0:a]channelsplit=channel_layout=stereo[L][R]; \
-[L]asplit=2[Lu][Lf]; \
-[Lf]${DEFAULT_FILTERS}[Lfx]; \
-[R]asplit=2[Ru][Rf]; \
-[Rf]${DEFAULT_FILTERS}[Rfx]" \
-    -map "[Lu]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+[0:a]asplit=2[aL][aR]; \
+[aL]pan=mono|c0=FL[Lu]; \
+[aR]pan=mono|c0=FR[Ru]; \
+[Lu]asplit=2[Lu_raw][Lu_f]; \
+[Ru]asplit=2[Ru_raw][Ru_f]; \
+[Lu_f]${DEFAULT_FILTERS}[Lu_fx]; \
+[Ru_f]${DEFAULT_FILTERS}[Ru_fx]" \
+    -map "[Lu_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw \
-    -map "[Ru]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Ru_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw \
-    -map "[Lfx]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Lu_fx]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt \
-    -map "[Rfx]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Ru_fx]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt \
     >> ${log_file} 2>&1
 
