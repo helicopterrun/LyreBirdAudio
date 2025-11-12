@@ -157,4 +157,180 @@ start_ffmpeg_stream() {
 
   # Filter graph creates 6 outputs per device:
   # 1. Raw L/R - unprocessed mono channels (archival/troubleshooting)
-  # 2. Filtered
+  # 2. Filtered L/R - general purpose monitoring (natural, comfortable levels)
+  # 3. Bird L/R - detection optimized (aggressive HPF, gain, compression)
+  cat > "$wrapper" << EOF
+#!/bin/bash
+while true; do
+  ffmpeg -hide_banner -loglevel warning \
+    -thread_queue_size 512 \
+    -f alsa -ar ${DEFAULT_SAMPLE_RATE} -ac ${DEFAULT_CHANNELS} -i plughw:${card_num},0 \
+    -filter_complex "\
+[0:a]asplit=2[aL][aR]; \
+[aL]pan=mono|c0=FL[Lu]; \
+[aR]pan=mono|c0=FR[Ru]; \
+[Lu]asplit=2[Lu_raw][Lu_f]; \
+[Ru]asplit=2[Ru_raw][Ru_f]; \
+[Lu_f]${DEFAULT_FILTERS}[Lu_filt_out]; \
+[Ru_f]${DEFAULT_FILTERS}[Ru_filt_out]; \
+[Lu_filt_out]asplit=2[Lu_filt][Lu_bird_pre]; \
+[Ru_filt_out]asplit=2[Ru_filt][Ru_bird_pre]; \
+[Lu_bird_pre]${BIRD_FILTERS}[Lu_bird]; \
+[Ru_bird_pre]${BIRD_FILTERS}[Ru_bird]" \
+    -map "[Lu_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw \
+    -map "[Ru_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw \
+    -map "[Lu_filt]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt \
+    -map "[Ru_filt]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt \
+    -map "[Lu_bird]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_bird \
+    -map "[Ru_bird]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_bird \
+    >> ${log_file} 2>&1
+
+  echo "[\$(date)] FFmpeg exited, restarting in 5s" >> ${log_file}
+  sleep 5
+done
+EOF
+
+  chmod +x "$wrapper"
+  nohup bash "$wrapper" >/dev/null 2>&1 &
+  echo $! > "${FFMPEG_PID_DIR}/${stream_name}.pid"
+  log INFO "Stream started: $stream_name (PID: $!)"
+}
+
+start_mediamtx() {
+  acquire_lock || error_exit "Failed to acquire lock"
+  cleanup_stale_processes
+
+  log INFO "Starting MediaMTX..."
+  local -a devices; mapfile -t devices < <(detect_audio_devices)
+  [[ ${#devices[@]} -gt 0 ]] || error_exit "No USB audio devices found"
+  log INFO "Found ${#devices[@]} USB audio device(s)"
+
+  generate_mediamtx_config
+  nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >> "${MEDIAMTX_LOG_FILE}" 2>&1 &
+  local pid=$!; echo "$pid" > "${PID_FILE}"
+  sleep 1
+  kill -0 "$pid" 2>/dev/null || error_exit "MediaMTX failed to start"
+  wait_for_mediamtx_ready "$pid" || error_exit "MediaMTX not ready"
+  log INFO "MediaMTX started (PID: $pid)"
+
+  for dev in "${devices[@]}"; do
+    IFS=':' read -r device_name card_num <<< "$dev"
+    local stream_name; stream_name="$(generate_stream_name "$device_name")"
+    start_ffmpeg_stream "$device_name" "$card_num" "$stream_name"
+  done
+
+  echo; echo -e "${GREEN}=== Available RTSP Streams (6 per device) ===${NC}"
+  for dev in "${devices[@]}"; do
+    IFS=':' read -r device_name card_num <<< "$dev"
+    local stream_name; stream_name="$(generate_stream_name "$device_name")"
+    echo -e "${GREEN}✔${NC} ${stream_name}:"
+    echo "   ${CYAN}Raw (unprocessed):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
+    echo "   ${CYAN}Filtered (general monitoring):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
+    echo "   ${CYAN}Bird (detection optimized):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_bird"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_bird"
+    echo
+  done
+  release_lock
+}
+
+stop_mediamtx() {
+  STOPPING_SERVICE=true
+  log INFO "Stopping MediaMTX..."
+  cleanup_stale_processes
+  log INFO "MediaMTX stopped"
+  STOPPING_SERVICE=false
+  release_lock
+}
+
+show_status() {
+  echo -e "${CYAN}=== MediaMTX Audio Stream Status ===${NC}"
+  echo
+  if [[ -f "${PID_FILE}" ]]; then
+    local pid; pid=$(cat "${PID_FILE}")
+    if kill -0 "$pid" 2>/dev/null; then
+      echo -e "MediaMTX: ${GREEN}Running${NC} (PID: $pid)"
+    else
+      echo -e "MediaMTX: ${RED}Not running${NC}"
+    fi
+  else
+    echo -e "MediaMTX: ${RED}Not running${NC}"
+  fi
+  echo
+  echo "USB Audio Devices:"
+  local -a devices; mapfile -t devices < <(detect_audio_devices 2>/dev/null || true)
+  if [[ ${#devices[@]} -eq 0 ]]; then
+    echo "  No devices found"
+  else
+    for dev in "${devices[@]}"; do
+      IFS=':' read -r device_name card_num <<< "$dev"
+      local stream_name; stream_name="$(generate_stream_name "$device_name")"
+      echo "  - $device_name (card $card_num)"
+      echo "    Stream set: ${stream_name}"
+      echo "      Raw:      _left_raw, _right_raw (unprocessed archival)"
+      echo "      Filtered: _left_filt, _right_filt (0dB, 2x 600Hz HPF, 2x 12kHz LPF, 2:1 comp)"
+      echo "      Bird:     _left_bird, _right_bird (4x 4kHz HPF + 30dB + 6:1 comp + limiter)"
+      if [[ -f "${FFMPEG_PID_DIR}/${stream_name}.pid" ]]; then
+        local fpid; fpid=$(cat "${FFMPEG_PID_DIR}/${stream_name}.pid")
+        if kill -0 "$fpid" 2>/dev/null; then
+          echo -e "    Status: ${GREEN}Running${NC} (PID: $fpid)"
+        else
+          echo -e "    Status: ${RED}Not running${NC}"
+        fi
+      else
+        echo -e "    Status: ${RED}Not running${NC}"
+      fi
+      echo
+    done
+  fi
+  echo "Filter Pipeline Details:"
+  echo "  Monitoring: 0dB → 2x 600Hz HPF (24dB/oct) → 2x 12kHz LPF (24dB/oct) → 2:1 compression"
+  echo "  Bird:       4x 4000Hz HPF (48dB/oct) → +30dB gain → 6:1 compression → -4dB limiter"
+  echo "              (Compressor: -10dB threshold, 3ms attack, 100ms release)"
+  echo "              (Limiter: -4dB ceiling, 1ms attack, guarantees zero clipping)"
+  echo
+  echo "Expected Bird Stream Metrics:"
+  echo "  Peak:       -4dB to -5dB (safe headroom)"
+  echo "  RMS:        -20dB to -22dB (strong average)"
+  echo "  Energy:     >70% in 3-8kHz (optimal for BirdNET)"
+  echo "  Clipping:   0% (guaranteed)"
+}
+
+main() {
+  case "${1:-help}" in
+    start)
+      [[ $EUID -eq 0 ]] || error_exit "Must run as root"
+      mkdir -p "$(dirname "${LOG_FILE}")"
+      start_mediamtx
+      ;;
+    stop)
+      [[ $EUID -eq 0 ]] || error_exit "Must run as root"
+      stop_mediamtx
+      ;;
+    restart)
+      [[ $EUID -eq 0 ]] || error_exit "Must run as root"
+      stop_mediamtx
+      sleep 2
+      start_mediamtx
+      ;;
+    status)
+      show_status
+      ;;
+    *)
+      echo "Usage: $SCRIPT_NAME {start|stop|restart|status}"
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
