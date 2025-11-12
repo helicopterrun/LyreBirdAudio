@@ -1,10 +1,10 @@
 #!/bin/bash
 # mediamtx-stream-manager.sh - 6 streams per device: raw, filtered, bird-optimized
-# Version: 1.8.2 - Cascaded filters for steep slopes, fixed limiter
+# Version: 1.8.3 - Triple-stacked 3kHz HPF, reduced gain, safer limiter
 
 set -euo pipefail
 
-readonly VERSION="1.8.2"
+readonly VERSION="1.8.3"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -29,10 +29,11 @@ readonly DEFAULT_MONO_BITRATE="64k"
 # Simple cascaded filters for maximum compatibility
 readonly DEFAULT_FILTERS="volume=-3dB,highpass=f=800,highpass=f=800,lowpass=f=10000,lowpass=f=10000,aresample=async=1:first_pts=0"
 
-# Bird detection optimized: 24dB/octave 3kHz HPF + 38dB gain + compression + limiting
-# Double-stacked 3kHz HPF for 24dB/octave slope (2x12dB/octave)
-# Limiter at -2dB to prevent clipping
-readonly BIRD_FILTERS="highpass=f=3000,highpass=f=3000,volume=38dB,acompressor=threshold=-8dB:ratio=4:attack=5:release=50,alimiter=limit=-2dB:attack=2:release=50"
+# Bird detection optimized: 36dB/octave 3kHz HPF + 36dB gain + compression + limiting
+# Triple-stacked 3kHz HPF for 36dB/octave slope - aggressive low-freq rejection
+# Reduced gain to +36dB (from 38dB) for more headroom
+# Limiter at -3dB to prevent clipping (right channel was still hitting -0.08dB)
+readonly BIRD_FILTERS="highpass=f=3000,highpass=f=3000,highpass=f=3000,volume=36dB,acompressor=threshold=-8dB:ratio=4:attack=5:release=50,alimiter=limit=-3dB:attack=2:release=50"
 
 # ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
@@ -291,9 +292,9 @@ show_status() {
   fi
   echo "Filter Pipeline:"
   echo "  General: -3dB → 2x 800Hz HPF (24dB/oct) → 2x 10kHz LPF (24dB/oct)"
-  echo "  Bird:    General → 2x 3000Hz HPF (24dB/oct) → +38dB → Compressor → Limiter"
+  echo "  Bird:    General → 3x 3000Hz HPF (36dB/oct) → +36dB → Compressor → Limiter"
   echo "           (Compressor: -8dB threshold, 4:1 ratio)"
-  echo "           (Limiter: -2dB hard ceiling, prevents clipping)"
+  echo "           (Limiter: -3dB hard ceiling, prevents clipping)"
 }
 
 main() {
