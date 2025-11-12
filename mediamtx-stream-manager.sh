@@ -1,10 +1,10 @@
 #!/bin/bash
 # mediamtx-stream-manager.sh - 6 streams per device: raw, filtered, bird-optimized
-# Version: 1.8.1 - Bird detection with dynamic compression and limiting
+# Version: 1.8.2 - Fixed limiter ceiling and steeper HPF slopes
 
 set -euo pipefail
 
-readonly VERSION="1.8.1"
+readonly VERSION="1.8.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -26,12 +26,13 @@ readonly DEFAULT_CODEC="libopus"         # use libopus (stable), not native 'opu
 readonly DEFAULT_MONO_BITRATE="64k"
 
 # General purpose filtering: gentle processing for normal listening
-readonly DEFAULT_FILTERS="volume=-3dB,highpass=f=800,lowpass=f=10000,aresample=async=1:first_pts=0"
+readonly DEFAULT_FILTERS="volume=-3dB,highpass=f=800:poles=2:width_type=h:width=200,lowpass=f=10000:poles=2:width_type=h:width=1000,aresample=async=1:first_pts=0"
 
-# Bird detection optimized: additional 3kHz HPF + 38dB gain + compression + limiting
+# Bird detection optimized: aggressive 3kHz HPF + 38dB gain + compression + limiting
 # Applied AFTER DEFAULT_FILTERS for cascaded effect
-# Protection against loud close-by birds (crows, etc): compressor + hard limiter at -1dB
-readonly BIRD_FILTERS="highpass=f=3000,volume=38dB,acompressor=threshold=-8dB:ratio=4:attack=5:release=50,alimiter=limit=-1dB:attack=2:release=50"
+# 4-pole HPF = 24dB/octave slope for aggressive low-frequency rejection
+# Limiter at -2dB to prevent clipping (was hitting 0dBFS)
+readonly BIRD_FILTERS="highpass=f=3000:poles=4:width_type=h:width=500,volume=38dB,acompressor=threshold=-8dB:ratio=4:attack=5:release=50,alimiter=limit=-2dB:attack=2:release=50"
 
 # ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
@@ -289,10 +290,10 @@ show_status() {
     done
   fi
   echo "Filter Pipeline:"
-  echo "  General: -3dB → 800Hz HPF → 10kHz LPF"
-  echo "  Bird:    General → 3000Hz HPF → +38dB → Compressor → Limiter"
+  echo "  General: -3dB → 800Hz HPF (12dB/oct) → 10kHz LPF (12dB/oct)"
+  echo "  Bird:    General → 3000Hz HPF (24dB/oct) → +38dB → Compressor → Limiter"
   echo "           (Compressor: -8dB threshold, 4:1 ratio)"
-  echo "           (Limiter: -1dB hard ceiling, prevents clipping)"
+  echo "           (Limiter: -2dB hard ceiling, prevents clipping)"
 }
 
 main() {
