@@ -1,10 +1,10 @@
 #!/bin/bash
-# mediamtx-stream-manager.sh - Mono-only: raw L/R + filtered L/R, libopus
-# Version: 1.7.0
+# mediamtx-stream-manager.sh - 6 streams per device: raw, filtered, bird-optimized
+# Version: 1.8.1 - Bird detection with dynamic compression and limiting
 
 set -euo pipefail
 
-readonly VERSION="1.7.0"
+readonly VERSION="1.8.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -25,8 +25,13 @@ readonly DEFAULT_CHANNELS="2"            # capture stereo → split to mono
 readonly DEFAULT_CODEC="libopus"         # use libopus (stable), not native 'opus'
 readonly DEFAULT_MONO_BITRATE="64k"
 
-# headroom + filters (soft headroom prevents HPF clipping messages)
+# General purpose filtering: gentle processing for normal listening
 readonly DEFAULT_FILTERS="volume=-3dB,highpass=f=800,lowpass=f=10000,aresample=async=1:first_pts=0"
+
+# Bird detection optimized: additional 3kHz HPF + 38dB gain + compression + limiting
+# Applied AFTER DEFAULT_FILTERS for cascaded effect
+# Protection against loud close-by birds (crows, etc): compressor + hard limiter at -1dB
+readonly BIRD_FILTERS="highpass=f=3000,volume=38dB,acompressor=threshold=-8dB:ratio=4:attack=5:release=50,alimiter=limit=-1dB:attack=2:release=50"
 
 # ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
@@ -140,14 +145,15 @@ EOF
 start_ffmpeg_stream() {
   local device_name="$1"; local card_num="$2"; local stream_name="$3"
 
-  log INFO "Starting mono stream set: $stream_name (card $card_num)"
+  log INFO "Starting 6-stream set for: $stream_name (card $card_num)"
   local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
   local log_file="${FFMPEG_PID_DIR}/${stream_name}.log"
   mkdir -p "${FFMPEG_PID_DIR}"
 
-  # Robust filtergraph using pan/asplit (avoids fragile channel_layout assumptions):
-  # - Split input to two copies, pan each to mono L/R
-  # - Split each mono into raw + filtered; apply DEFAULT_FILTERS to the filtered branch
+  # Filter graph creates 6 outputs per device:
+  # 1. Raw L/R - unprocessed mono channels
+  # 2. Filtered L/R - general purpose (-3dB, 800Hz HPF, 10kHz LPF)
+  # 3. Bird L/R - filtered + additional 3kHz HPF + 40dB gain
   cat > "$wrapper" << EOF
 #!/bin/bash
 while true; do
@@ -160,16 +166,24 @@ while true; do
 [aR]pan=mono|c0=FR[Ru]; \
 [Lu]asplit=2[Lu_raw][Lu_f]; \
 [Ru]asplit=2[Ru_raw][Ru_f]; \
-[Lu_f]${DEFAULT_FILTERS}[Lu_fx]; \
-[Ru_f]${DEFAULT_FILTERS}[Ru_fx]" \
+[Lu_f]${DEFAULT_FILTERS}[Lu_filt_out]; \
+[Ru_f]${DEFAULT_FILTERS}[Ru_filt_out]; \
+[Lu_filt_out]asplit=2[Lu_filt][Lu_bird_pre]; \
+[Ru_filt_out]asplit=2[Ru_filt][Ru_bird_pre]; \
+[Lu_bird_pre]${BIRD_FILTERS}[Lu_bird]; \
+[Ru_bird_pre]${BIRD_FILTERS}[Ru_bird]" \
     -map "[Lu_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw \
     -map "[Ru_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw \
-    -map "[Lu_fx]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Lu_filt]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt \
-    -map "[Ru_fx]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Ru_filt]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt \
+    -map "[Lu_bird]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_bird \
+    -map "[Ru_bird]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_bird \
     >> ${log_file} 2>&1
 
   echo "[\$(date)] FFmpeg exited, restarting in 5s" >> ${log_file}
@@ -206,17 +220,22 @@ start_mediamtx() {
     start_ffmpeg_stream "$device_name" "$card_num" "$stream_name"
   done
 
-  echo; echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
+  echo; echo -e "${GREEN}=== Available RTSP Streams (6 per device) ===${NC}"
   for dev in "${devices[@]}"; do
     IFS=':' read -r device_name card_num <<< "$dev"
     local stream_name; stream_name="$(generate_stream_name "$device_name")"
     echo -e "${GREEN}✔${NC} ${stream_name}:"
-    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
-    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
-    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
-    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
+    echo "   ${CYAN}Raw (unprocessed):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
+    echo "   ${CYAN}Filtered (general purpose):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
+    echo "   ${CYAN}Bird (optimized + compressed):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_bird"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_bird"
+    echo
   done
-  echo
   release_lock
 }
 
@@ -252,11 +271,10 @@ show_status() {
       IFS=':' read -r device_name card_num <<< "$dev"
       local stream_name; stream_name="$(generate_stream_name "$device_name")"
       echo "  - $device_name (card $card_num)"
-      echo "    Streams:"
-      echo "      rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
-      echo "      rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
-      echo "      rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
-      echo "      rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
+      echo "    Stream set: ${stream_name}"
+      echo "      Raw:      _left_raw, _right_raw (unprocessed)"
+      echo "      Filtered: _left_filt, _right_filt (-3dB, 800Hz HPF, 10kHz LPF)"
+      echo "      Bird:     _left_bird, _right_bird (filtered + 3kHz HPF + 38dB + compression)"
       if [[ -f "${FFMPEG_PID_DIR}/${stream_name}.pid" ]]; then
         local fpid; fpid=$(cat "${FFMPEG_PID_DIR}/${stream_name}.pid")
         if kill -0 "$fpid" 2>/dev/null; then
@@ -267,8 +285,14 @@ show_status() {
       else
         echo -e "    Status: ${RED}Not running${NC}"
       fi
+      echo
     done
   fi
+  echo "Filter Pipeline:"
+  echo "  General: -3dB → 800Hz HPF → 10kHz LPF"
+  echo "  Bird:    General → 3000Hz HPF → +38dB → Compressor → Limiter"
+  echo "           (Compressor: -8dB threshold, 4:1 ratio)"
+  echo "           (Limiter: -1dB hard ceiling, prevents clipping)"
 }
 
 main() {
