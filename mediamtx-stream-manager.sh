@@ -193,12 +193,12 @@ while true; do
 [Ru]asplit=2[Ru_raw][Ru_f]; \
 [Lu_f]${DEFAULT_FILTERS}[Lu_filt_out]; \
 [Ru_f]${DEFAULT_FILTERS}[Ru_filt_out]; \
-[Lu_filt_out]asplit=2[Lu_filt][Lu_bird_pre]; \
-[Ru_filt_out]asplit=2[Ru_filt][Ru_bird_pre]; \
+[Lu_filt_out]asplit=3[Lu_filt][Lu_bird_pre][Lu_frigate_pre]; \
+[Ru_filt_out]asplit=3[Ru_filt][Ru_bird_pre][Ru_frigate_pre]; \
 [Lu_bird_pre]${BIRD_FILTERS}[Lu_bird]; \
 [Ru_bird_pre]${BIRD_FILTERS}[Ru_bird]; \
-[Lu_filt_out]${FRIGATE_FILTERS}[Lu_frigate]; \
-[Ru_filt_out]${FRIGATE_FILTERS}[Ru_frigate]" \
+[Lu_frigate_pre]${FRIGATE_FILTERS}[Lu_frigate]; \
+[Ru_frigate_pre]${FRIGATE_FILTERS}[Ru_frigate]" \
     -map "[stereo_raw]" -ac 2 -c:a ${DEFAULT_CODEC} -b:a 128k -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_raw_stereo \
     -map "[Lu_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
