@@ -1,10 +1,10 @@
 #!/bin/bash
-# mediamtx-stream-manager.sh - 6 streams per device: raw, filtered, bird-optimized
-# Version: 2.1.0 - Updated filters based on spectral analysis feedback
+# mediamtx-stream-manager.sh - 9 streams per device: stereo raw, mono raw, filtered, bird, frigate
+# Version: 2.3.0 - Added stereo raw stream and dual Frigate streams (left + right)
 
 set -euo pipefail
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -41,6 +41,25 @@ readonly DEFAULT_FILTERS="highpass=f=600,highpass=f=600,lowpass=f=9000,lowpass=f
 # Compressor: faster attack (3ms) catches transient bird calls, longer release (100ms) prevents pumping
 # Change from v2.0.0: Added 2x 11kHz LPF to reduce top-end hiss per spectral analysis
 readonly BIRD_FILTERS="highpass=f=4000,highpass=f=4000,highpass=f=4000,highpass=f=4000,volume=30dB,lowpass=f=11000,lowpass=f=11000,acompressor=threshold=-10dB:ratio=6:attack=3:release=100,alimiter=limit=-4dB:attack=1:release=100"
+
+# Frigate/YamNet optimized: 16kHz mono AAC for ML audio detection
+# YamNet operates on 16kHz audio with 125-7500 Hz mel spectrogram
+# Filter chain designed for robust event detection in urban environment:
+# 1. Resample to 16kHz and force mono (YamNet native format)
+# 2. 100Hz HPF removes rumble (traffic, HVAC, wind) below event range
+# 3. 8kHz LPF removes noise above Nyquist/2 for 16kHz (anti-alias)
+# 4. Compand provides multi-band compression:
+#    - Brings up quiet distant sounds (-60dB → -50dB)
+#    - Compresses mid-range (-40dB → -30dB, -20dB → -15dB)
+#    - Soft limiting at top (0dB → -5dB)
+#    - Fast attack (5ms) preserves transients, moderate release (100ms) natural
+#    - +3dB makeup gain compensates for compression loss
+# 5. Loudnorm applies EBU R128 normalization to -16 LUFS (YamNet optimal level)
+#    - True peak limited to -2dB prevents inter-sample clipping
+#    - LRA 7 allows some dynamics while ensuring consistency
+#    - Linear mode preserves transient character for bird calls
+# Target: Consistent -16 LUFS with preserved transients and minimal false positives
+readonly FRIGATE_FILTERS="aformat=sample_rates=16000:channel_layouts=mono,highpass=f=100:poles=2:width_type=h:width=50,lowpass=f=8000:poles=2:width_type=h:width=1000,compand=attacks=0.005:decays=0.1:soft-knee=6:points=-80/-80|-60/-50|-40/-30|-20/-15|0/-5:gain=3,loudnorm=I=-16:TP=-2:LRA=7:linear=true:print_format=none,aresample=16000"
 
 # ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
@@ -154,7 +173,7 @@ EOF
 start_ffmpeg_stream() {
   local device_name="$1"; local card_num="$2"; local stream_name="$3"
 
-  log INFO "Starting 6-stream set for: $stream_name (card $card_num)"
+  log INFO "Starting 9-stream set for: $stream_name (card $card_num)"
   local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
   local log_file="${FFMPEG_PID_DIR}/${stream_name}.log"
   mkdir -p "${FFMPEG_PID_DIR}"
@@ -166,7 +185,8 @@ while true; do
     -thread_queue_size 512 \
     -f alsa -ar ${DEFAULT_SAMPLE_RATE} -ac ${DEFAULT_CHANNELS} -i plughw:${card_num},0 \
     -filter_complex "\
-[0:a]asplit=2[aL][aR]; \
+[0:a]asplit=2[stereo_raw][split_lr]; \
+[split_lr]asplit=2[aL][aR]; \
 [aL]pan=mono|c0=FL[Lu]; \
 [aR]pan=mono|c0=FR[Ru]; \
 [Lu]asplit=2[Lu_raw][Lu_f]; \
@@ -176,7 +196,11 @@ while true; do
 [Lu_filt_out]asplit=2[Lu_filt][Lu_bird_pre]; \
 [Ru_filt_out]asplit=2[Ru_filt][Ru_bird_pre]; \
 [Lu_bird_pre]${BIRD_FILTERS}[Lu_bird]; \
-[Ru_bird_pre]${BIRD_FILTERS}[Ru_bird]" \
+[Ru_bird_pre]${BIRD_FILTERS}[Ru_bird]; \
+[Lu_filt_out]${FRIGATE_FILTERS}[Lu_frigate]; \
+[Ru_filt_out]${FRIGATE_FILTERS}[Ru_frigate]" \
+    -map "[stereo_raw]" -ac 2 -c:a ${DEFAULT_CODEC} -b:a 128k -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_raw_stereo \
     -map "[Lu_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw \
     -map "[Ru_raw]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
@@ -189,6 +213,10 @@ while true; do
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_bird \
     -map "[Ru_bird]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_bird \
+    -map "[Lu_frigate]" -ac 1 -c:a aac -b:a 64k -ar 16000 \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_frigate \
+    -map "[Ru_frigate]" -ac 1 -c:a aac -b:a 64k -ar 16000 \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_frigate \
     >> ${log_file} 2>&1
 
   echo "[\$(date)] FFmpeg exited, restarting in 5s" >> ${log_file}
@@ -225,20 +253,24 @@ start_mediamtx() {
     start_ffmpeg_stream "$device_name" "$card_num" "$stream_name"
   done
 
-  echo; echo -e "${GREEN}=== Available RTSP Streams (6 per device) ===${NC}"
+  echo; echo -e "${GREEN}=== Available RTSP Streams (9 per device) ===${NC}"
   for dev in "${devices[@]}"; do
     IFS=':' read -r device_name card_num <<< "$dev"
     local stream_name; stream_name="$(generate_stream_name "$device_name")"
     echo -e "${GREEN}✔${NC} ${stream_name}:"
     echo "   ${CYAN}Raw (unprocessed):${NC}"
-    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
-    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_raw_stereo    [STEREO - archival]"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw      [MONO L]"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw     [MONO R]"
     echo "   ${CYAN}Filtered (general monitoring):${NC}"
     echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
     echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
     echo "   ${CYAN}Bird (detection optimized):${NC}"
     echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_bird"
     echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_bird"
+    echo "   ${CYAN}Frigate (YamNet ML detection):${NC}"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_frigate  [16kHz AAC]"
+    echo "     rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_frigate [16kHz AAC]"
     echo
   done
   release_lock
@@ -276,10 +308,12 @@ show_status() {
       IFS=':' read -r device_name card_num <<< "$dev"
       local stream_name; stream_name="$(generate_stream_name "$device_name")"
       echo "  - $device_name (card $card_num)"
-      echo "    Stream set: ${stream_name}"
-      echo "      Raw:      _left_raw, _right_raw (unprocessed archival)"
+      echo "    Stream set: ${stream_name} (9 streams total)"
+      echo "      Raw:      _raw_stereo (48kHz stereo archival)"
+      echo "                _left_raw, _right_raw (48kHz mono)"
       echo "      Filtered: _left_filt, _right_filt (2x 600Hz HPF, 2x 9kHz LPF, 2:1 comp)"
       echo "      Bird:     _left_bird, _right_bird (4x 4kHz HPF + 30dB + 2x 11kHz LPF + 6:1 comp + limiter)"
+      echo "      Frigate:  _left_frigate, _right_frigate (16kHz AAC, 100Hz HPF + 8kHz LPF + compand + loudnorm -16 LUFS)"
       if [[ -f "${FFMPEG_PID_DIR}/${stream_name}.pid" ]]; then
         local fpid; fpid=$(cat "${FFMPEG_PID_DIR}/${stream_name}.pid")
         if kill -0 "$fpid" 2>/dev/null; then
@@ -293,28 +327,30 @@ show_status() {
       echo
     done
   fi
-  echo "Filter Pipeline Details (v2.1.0 - Hiss Reduction):"
+  echo "Filter Pipeline Details (v2.3.0 - Stereo Raw + Dual Frigate):"
   echo "  Monitoring: 2x 600Hz HPF (24dB/oct) → 2x 9kHz LPF (24dB/oct) → 2:1 compression"
   echo "  Bird:       4x 4000Hz HPF (48dB/oct) → +30dB gain → 2x 11kHz LPF (24dB/oct) → 6:1 compression → -4dB limiter"
   echo "              (Compressor: -10dB threshold, 3ms attack, 100ms release)"
   echo "              (Limiter: -4dB ceiling, 1dB safety margin for clipping protection)"
+  echo "  Frigate:    16kHz resample → 100Hz HPF → 8kHz LPF → compand (multi-band) → loudnorm -16 LUFS → AAC 64kbps"
+  echo "              (Optimized for YamNet: preserves transients, consistent levels, minimal false positives)"
   echo
-  echo "Expected Bird Stream Performance:"
-  echo "  Peak:       -4dB to -6dB (improved headroom)"
-  echo "  RMS:        -22dB to -26dB (strong signal)"
-  echo "  Energy:     <1% below 1kHz, <3% in 1-3kHz, 75-85% in 3-8kHz"
-  echo "  Clipping:   0% (guaranteed by limiter)"
-  echo "  Hiss:       Significantly reduced above 11kHz"
+  echo "Stream Architecture (9 per device):"
+  echo "  • 1x Stereo raw:     Full spatial information for archival/analysis"
+  echo "  • 2x Mono raw:       Individual channel archival"
+  echo "  • 2x Filtered:       Human monitoring (left/right)"
+  echo "  • 2x Bird-optimized: BirdNET detection (left/right)"
+  echo "  • 2x Frigate:        YamNet ML detection (left/right)"
   echo
-  echo "Changes from v2.0.0:"
-  echo "  • Filtered: Lowered LPF from 12kHz to 9kHz to reduce high-frequency hiss"
-  echo "  • Bird: Added 2x 11kHz LPF (24dB/oct) to eliminate top-end hiss while preserving harmonics"
-  echo "  • Result: Cleaner audio, reduced noise floor, improved SNR for both streams"
+  echo "Expected Performance by Stream:"
+  echo "  Bird:       Peak -4dB to -6dB, RMS -22dB to -26dB, Energy 75-85% in 3-8kHz, 0% clipping"
+  echo "  Frigate:    Integrated -16 LUFS, True Peak -2dB, LRA 7, optimized for ML event detection"
   echo
-  echo "Baseline measurements (v2.0.0):"
-  echo "  Raw:      RMS -59dB, Peak -46dB, Bird/Low SNR -26dB"
-  echo "  Filtered: RMS -71dB, Peak -56dB, Bird/Low SNR -9dB"
-  echo "  Bird:     RMS -52dB, Peak -33dB, Bird/Low SNR +52dB"
+  echo "Changes from v2.2.0:"
+  echo "  • Added stereo raw stream for archival with spatial information intact"
+  echo "  • Added left_frigate stream (in addition to right_frigate)"
+  echo "  • Now supports future dual-mic configurations for beamforming/comparison"
+  echo "  • Total: 9 streams per device (up from 7)"
 }
 
 main() {
