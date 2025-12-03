@@ -48,20 +48,20 @@ readonly BIRD_FILTERS="highpass=f=4000,highpass=f=4000,highpass=f=4000,highpass=
 # 1. Force 48kHz mono (Frigate's native rate, avoids extra resampling)
 # 2. 100Hz HPF removes rumble (traffic, HVAC, wind) below event range
 # 3. 8kHz LPF removes noise above useful range for audio events
-# 4. Volume boost: +12dB to bring quiet environmental sounds into Frigate's detection range
+# 4. Volume boost: +24dB to bring quiet environmental sounds into Frigate's detection range
 # 5. Compand provides multi-band compression:
-#    - Brings up quiet distant sounds (-60dB → -45dB for better detection)
-#    - Compresses mid-range (-40dB → -28dB, -20dB → -12dB)
-#    - Soft limiting at top (0dB → -3dB)
+#    - Brings up quiet distant sounds (-60dB → -40dB for excellent detection)
+#    - Compresses mid-range (-40dB → -25dB, -20dB → -10dB)
+#    - Soft limiting at top (0dB → -2dB)
 #    - Fast attack (5ms) preserves transients, moderate release (100ms) natural
-#    - +3dB makeup gain compensates for compression loss
-# 6. Loudnorm applies EBU R128 normalization to -12 LUFS (louder target for Frigate)
-#    - Higher than YamNet optimal (-16) to ensure detection above min_volume threshold
+#    - +6dB makeup gain compensates for compression loss
+# 6. Loudnorm applies EBU R128 normalization to -6 LUFS (very loud target for Frigate)
+#    - Much louder than typical broadcast (-23 LUFS) to ensure reliable detection
 #    - True peak limited to -1dB prevents clipping
-#    - LRA 9 allows more dynamics for varied environmental sounds
+#    - LRA 11 allows more dynamics for varied environmental sounds
 #    - Linear mode preserves transient character for bird calls
-# Target: Consistent -12 LUFS with preserved transients, loud enough for reliable Frigate detection
-readonly FRIGATE_FILTERS="aformat=sample_rates=48000:channel_layouts=mono,highpass=f=100:poles=2:width_type=h:width=50,lowpass=f=8000:poles=2:width_type=h:width=1000,volume=12dB,compand=attacks=0.005:decays=0.1:soft-knee=6:points=-80/-80|-60/-45|-40/-28|-20/-12|0/-3:gain=3,loudnorm=I=-12:TP=-1:LRA=9:linear=true:print_format=none"
+# Target: Consistent -6 LUFS (very loud) with preserved transients for reliable Frigate detection
+readonly FRIGATE_FILTERS="aformat=sample_rates=48000:channel_layouts=mono,highpass=f=100:poles=2:width_type=h:width=50,lowpass=f=8000:poles=2:width_type=h:width=1000,volume=24dB,compand=attacks=0.005:decays=0.1:soft-knee=6:points=-80/-80|-60/-40|-40/-25|-20/-10|0/-2:gain=6,loudnorm=I=-6:TP=-1:LRA=11:linear=true:print_format=none"
 
 # ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
@@ -315,7 +315,7 @@ show_status() {
       echo "                _left_raw, _right_raw (48kHz mono)"
       echo "      Filtered: _left_filt, _right_filt (2x 600Hz HPF, 2x 9kHz LPF, 2:1 comp)"
       echo "      Bird:     _left_bird, _right_bird (4x 4kHz HPF + 30dB + 2x 11kHz LPF + 6:1 comp + limiter)"
-      echo "      Frigate:  _left_frigate, _right_frigate (48kHz Opus, 100Hz HPF + 8kHz LPF + 12dB boost + compand + loudnorm -12 LUFS)"
+      echo "      Frigate:  _left_frigate, _right_frigate (48kHz Opus, 100Hz HPF + 8kHz LPF + 24dB boost + compand + loudnorm -6 LUFS)"
       if [[ -f "${FFMPEG_PID_DIR}/${stream_name}.pid" ]]; then
         local fpid; fpid=$(cat "${FFMPEG_PID_DIR}/${stream_name}.pid")
         if kill -0 "$fpid" 2>/dev/null; then
@@ -334,8 +334,8 @@ show_status() {
   echo "  Bird:       4x 4000Hz HPF (48dB/oct) → +30dB gain → 2x 11kHz LPF (24dB/oct) → 6:1 compression → -4dB limiter"
   echo "              (Compressor: -10dB threshold, 3ms attack, 100ms release)"
   echo "              (Limiter: -4dB ceiling, 1dB safety margin for clipping protection)"
-  echo "  Frigate:    48kHz mono → 100Hz HPF → 8kHz LPF → +12dB boost → compand (multi-band) → loudnorm -12 LUFS → Opus 64kbps"
-  echo "              (Optimized for Frigate YamNet: louder target, preserves transients, reliable detection)"
+  echo "  Frigate:    48kHz mono → 100Hz HPF → 8kHz LPF → +24dB boost → compand (multi-band) → loudnorm -6 LUFS → Opus 64kbps"
+  echo "              (Optimized for Frigate YamNet: very loud target, preserves transients, reliable detection)"
   echo
   echo "Stream Architecture (9 per device):"
   echo "  • 1x Stereo raw:     Full spatial information for archival/analysis"
@@ -346,14 +346,14 @@ show_status() {
   echo
   echo "Expected Performance by Stream:"
   echo "  Bird:       Peak -4dB to -6dB, RMS -22dB to -26dB, Energy 75-85% in 3-8kHz, 0% clipping"
-  echo "  Frigate:    Integrated -12 LUFS, True Peak -1dB, LRA 9, louder for reliable detection"
+  echo "  Frigate:    Integrated -6 LUFS (very loud), True Peak -1dB, LRA 11, excellent for detection"
   echo
   echo "Changes from v2.2.0:"
   echo "  • Added stereo raw stream for archival with spatial information intact"
   echo "  • Added left_frigate stream (in addition to right_frigate)"
   echo "  • Switched Frigate streams from 16kHz AAC to 48kHz Opus (native Frigate format)"
-  echo "  • Increased Frigate volume: +12dB boost + -12 LUFS target (louder than previous -16 LUFS)"
-  echo "  • Adjusted compand for better detection of quiet distant sounds"
+  echo "  • Increased Frigate volume: +24dB boost + -6 LUFS target (very loud for reliable detection)"
+  echo "  • Adjusted compand for aggressive boost of quiet distant sounds"
   echo "  • Total: 9 streams per device"
 }
 
